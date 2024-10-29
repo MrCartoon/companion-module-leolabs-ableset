@@ -15,7 +15,10 @@
 		"@companion-module/base": "~1.6.0",
 		"lodash": "^4.17.21",
 		"node-osc": "^9.0.2",
-		"short-uuid": "^4.2.2"
+		"node-wav": "^0.0.2",
+		"shell-escape-tag": "^2.0.2",
+		"xmldom": "^0.6.0",
+		"xpath": "^0.0.34"
 	},
 	"devDependencies": {
 		"@companion-module/tools": "^1.4.1",
