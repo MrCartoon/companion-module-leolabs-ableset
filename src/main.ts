@@ -10,6 +10,8 @@ import { debounce, debounceGather } from './utils/debounce'
 import { makeRange } from './utils/range'
 import { variables } from './variables'
 import { getProgressIcon } from './icons'
+import { createCanvas, Image, Canvas } from 'canvas'
+const fs = require('fs')
 
 /** The port that AbleSet is listening on */
 const SERVER_PORT = 39041
@@ -29,6 +31,8 @@ class ModuleInstance extends InstanceBase<Config> {
 	songs: string[] = []
 	sections: string[] = []
 	sectionColors: number[] = []
+	sectionWaveforms: Canvas[] = []
+	sectionProgressPreviousState: { [key: string]: [number, Canvas, string] } = {}
 	activeSongName = ''
 	activeSongIndex = -1
 	activeSectionName = ''
@@ -125,6 +129,32 @@ class ModuleInstance extends InstanceBase<Config> {
 		} else {
 			this.log('error', "OSC client doesn't exist")
 		}
+	}
+
+	renderWaveform(id: number, upper: number[], lower: number[]) {
+		const width = upper.length
+		const height = 72
+		const canvas = createCanvas(width, height)
+		const ctx = canvas.getContext('2d')
+
+		ctx.beginPath()
+		ctx.moveTo(0, height / 2 - upper[0])
+
+		for (let i = 1; i < upper.length; i++) {
+			ctx.lineTo(i, height / 2 - upper[i])
+		}
+
+		ctx.lineTo(width, height / 2 - lower[lower.length - 1])
+
+		for (let i = lower.length - 1; i >= 0; i--) {
+			ctx.lineTo(i, height / 2 - lower[i])
+		}
+
+		ctx.closePath()
+		ctx.fill()
+		ctx.stroke()
+
+		this.sectionWaveforms[id] = canvas
 	}
 
 	/** Waits until all new OSC values are received before running updates */
@@ -244,6 +274,21 @@ class ModuleInstance extends InstanceBase<Config> {
 			this.debouncedCheckFeedbacks(Feedback.SectionColor)
 		})
 		server.on('/setlist/activeSongName', ([, activeSongName]) => {
+			if (activeSongName) {
+				this.sectionWaveforms = []
+				let sectionsWaveData = [] as number[][]
+
+				try {
+					const data = fs.readFileSync(`waveforms/${activeSongName}.json`, 'utf8')
+					sectionsWaveData = JSON.parse(data)
+				} catch (error) {
+					this.log('error', `Failed to read or parse sections wave data: ${error}`)
+				}
+				sectionsWaveData.forEach(([id, ...values]) => {
+					this.renderWaveform(id, values.slice(0, 72), values.slice(72, 144))
+				})
+			}
+
 			this.activeSongName = String(activeSongName ?? '')
 			this.updateSongs()
 		})
@@ -309,6 +354,7 @@ class ModuleInstance extends InstanceBase<Config> {
 				Feedback.CanJumpToPreviousSong,
 				Feedback.CanJumpToNextSection,
 				Feedback.CanJumpToPreviousSection,
+				Feedback.SectionProgressByNumber,
 			)
 		})
 		server.on('/setlist/loopEnabled', ([, loopEnabled]) => {
@@ -1027,8 +1073,9 @@ class ModuleInstance extends InstanceBase<Config> {
 			[Feedback.SectionProgressByNumber]: {
 				type: 'advanced',
 				name: 'Section Progress Background By Section Number',
-				callback: ({ options }) => {
+				callback: ({ options, feedbackId }) => {
 					let totalPercent
+					const beatsPosition = Number(this.getVariableValue('beatsPosition') ?? 0)
 					const relativeSectionIndex = options.relative
 						? Number(options.sectionNumber)
 						: Number(options.sectionNumber) - this.activeSectionIndex - 1
@@ -1039,13 +1086,32 @@ class ModuleInstance extends InstanceBase<Config> {
 					} else {
 						const activeSectionStart = Number(this.getVariableValue('activeSectionStart') ?? 0)
 						const activeSectionEnd = Number(this.getVariableValue('activeSectionEnd') ?? 0)
-						const beatsPosition = Number(this.getVariableValue('beatsPosition') ?? 0)
 						totalPercent = (beatsPosition - activeSectionStart) / (activeSectionEnd - activeSectionStart)
 					}
-
 					const absoluteSectionIndex = options.relative
 						? this.activeSectionIndex + Number(options.sectionNumber)
 						: Number(options.sectionNumber) - 1
+
+					const queued = Number(this.getVariableValue('queuedSongIndex')) === this.activeSongIndex
+					let queuedIndex = Number(this.getVariableValue('queuedSectionIndex'))
+					if (queued && queuedIndex == -1) { queuedIndex = 0 }
+
+					const futureQueue = queuedIndex > this.activeSectionIndex
+					const inBetween =
+						queued &&
+						((absoluteSectionIndex < queuedIndex && absoluteSectionIndex > this.activeSectionIndex) ||
+							(absoluteSectionIndex >= queuedIndex && absoluteSectionIndex <= this.activeSectionIndex))
+
+					// Don't re-render if selected section not in-between queue and progress didn't change
+					if (
+						!inBetween && this.sectionProgressPreviousState[feedbackId] &&
+						this.sectionProgressPreviousState[feedbackId][0] === totalPercent &&
+						this.sectionProgressPreviousState[feedbackId][1] === this.sectionWaveforms[absoluteSectionIndex]
+					) {
+						// Turns out if to return empty object, the Feedback removes previous png
+						return { png64: this.sectionProgressPreviousState[feedbackId][2] }
+					}
+
 					const style =
 						Number(this.sections.length) > 1 && options.style === 'slim'
 							? absoluteSectionIndex === 0
@@ -1057,7 +1123,87 @@ class ModuleInstance extends InstanceBase<Config> {
 								? ('fullTransparent' as const)
 								: ('full' as const)
 
-					return { png64: getProgressIcon(totalPercent, style) }
+					const sectionDynamicCanvas = createCanvas(72, 72)
+					const ctx = sectionDynamicCanvas.getContext('2d')
+					if (this.sectionWaveforms[absoluteSectionIndex]) {
+						ctx.globalAlpha = 0.6
+						ctx.drawImage(
+							this.sectionWaveforms[absoluteSectionIndex],
+							0,
+							options.style === 'slim' ? 21 : 0,
+							72,
+							options.style === 'slim' ? 30 : 72,
+						)
+						ctx.globalAlpha = 1
+					}
+
+					const progressIcon = getProgressIcon(totalPercent, style)
+
+					return new Promise((resolve, reject) => {
+						const progressImage = new Image()
+
+						progressImage.onload = () => {
+							ctx.drawImage(progressImage, 0, 0)
+							if (beatsPosition % 2 !== 0) {
+								if (inBetween) {
+									ctx.strokeStyle = 'yellow'
+									ctx.beginPath()
+									ctx.moveTo(0, 10)
+									ctx.lineTo(72, 10)
+									ctx.stroke()
+								}
+
+								if (queued && absoluteSectionIndex === this.activeSectionIndex) {
+									ctx.strokeStyle = 'yellow'
+									ctx.fillStyle = 'yellow'
+									ctx.beginPath()
+									if (futureQueue) {
+										ctx.moveTo(62, 0)
+										ctx.lineTo(72, 10)
+										ctx.lineTo(62, 20)
+									} else {
+										ctx.moveTo(72, 0)
+										ctx.lineTo(62, 10)
+										ctx.lineTo(72, 20)
+									}
+									ctx.closePath()
+									ctx.fill()
+									ctx.stroke()
+								}
+								if (queued && absoluteSectionIndex === queuedIndex) {
+									ctx.strokeStyle = 'yellow'
+									ctx.fillStyle = 'yellow'
+									ctx.beginPath()
+									if (futureQueue) {
+										ctx.moveTo(10, 0)
+										ctx.lineTo(0, 10)
+										ctx.lineTo(10, 20)
+									} else {
+										ctx.moveTo(0, 0)
+										ctx.lineTo(10, 10)
+										ctx.lineTo(0, 20)
+									}
+									ctx.closePath()
+									ctx.fill()
+									ctx.stroke()
+								}
+							}
+
+							const image = sectionDynamicCanvas.toBuffer('image/png').toString('base64')
+
+							this.sectionProgressPreviousState[feedbackId] = [
+								totalPercent,
+								this.sectionWaveforms[absoluteSectionIndex],
+								image,
+							]
+							resolve({ png64: image })
+						}
+
+						progressImage.onerror = () => {
+							reject(new Error('Failed to load image'))
+						}
+						progressImage.src = `data:image/png;base64,${progressIcon}`
+					})
 				},
 				options: [
 					{
